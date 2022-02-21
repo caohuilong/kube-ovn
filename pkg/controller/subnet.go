@@ -91,7 +91,11 @@ func (c *Controller) enqueueUpdateSubnet(old, new interface{}) {
 		oldSubnet.Spec.Gateway != newSubnet.Spec.Gateway ||
 		!reflect.DeepEqual(oldSubnet.Spec.ExcludeIps, newSubnet.Spec.ExcludeIps) ||
 		!reflect.DeepEqual(oldSubnet.Spec.Vips, newSubnet.Spec.Vips) ||
-		oldSubnet.Spec.Vlan != newSubnet.Spec.Vlan {
+		oldSubnet.Spec.Vlan != newSubnet.Spec.Vlan ||
+		oldSubnet.Spec.EnableDHCP != newSubnet.Spec.EnableDHCP ||
+		oldSubnet.Spec.DHCPv4Options != newSubnet.Spec.DHCPv4Options ||
+		oldSubnet.Spec.EnableIPv6RA != newSubnet.Spec.EnableIPv6RA ||
+		oldSubnet.Spec.IPv6RAConfigs != newSubnet.Spec.IPv6RAConfigs {
 		klog.V(3).Infof("enqueue update subnet %s", key)
 		c.addOrUpdateSubnetQueue.Add(key)
 	}
@@ -608,22 +612,36 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 	}
 
 	needRouter := (subnet.Spec.Vlan == "" || subnet.Spec.LogicalGateway) || subnet.Spec.Vpc != util.DefaultVpc
+	var dhcpOptions *ovs.DHCPOptions
 	if !exist {
 		subnet.Status.EnsureStandardConditions()
 		// If multiple namespace use same ls name, only first one will success
-		if err := c.ovnClient.CreateLogicalSwitch(subnet.Name, vpc.Status.Router, subnet.Spec.Protocol, subnet.Spec.CIDRBlock, subnet.Spec.Gateway, subnet.Spec.ExcludeIps, needRouter); err != nil {
+		if dhcpOptions, err = c.ovnClient.CreateLogicalSwitch(subnet.Name, vpc.Status.Router, subnet.Spec, needRouter); err != nil {
 			c.patchSubnetStatus(subnet, "CreateLogicalSwitchFailed", err.Error())
 			return err
 		}
 	} else {
 		// logical switch exists, only update other_config
-		if err := c.ovnClient.SetLogicalSwitchConfig(subnet.Name, vpc.Status.Router, subnet.Spec.Protocol, subnet.Spec.CIDRBlock, subnet.Spec.Gateway, subnet.Spec.ExcludeIps, needRouter); err != nil {
+		if dhcpOptions, err = c.ovnClient.SetLogicalSwitchConfig(subnet.Name, vpc.Status.Router, subnet.Spec, needRouter); err != nil {
 			c.patchSubnetStatus(subnet, "SetLogicalSwitchConfigFailed", err.Error())
 			return err
 		}
 		if !needRouter {
 			if err := c.ovnClient.RemoveRouterPort(subnet.Name, vpc.Status.Router); err != nil {
 				klog.Errorf("failed to remove router port from %s, %v", subnet.Name, err)
+				return err
+			}
+		}
+	}
+	if subnet.Status.DHCPv4OptionsUUID != dhcpOptions.DHCPv4OptionsUUID || subnet.Status.DHCPv6OptionsUUID != dhcpOptions.DHCPv6OptionsUUID {
+		subnet.Status.DHCPv4OptionsUUID = dhcpOptions.DHCPv4OptionsUUID
+		subnet.Status.DHCPv6OptionsUUID = dhcpOptions.DHCPv6OptionsUUID
+		bytes, err := subnet.Status.Bytes()
+		if err != nil {
+			klog.Error(err)
+		} else {
+			if _, err := c.config.KubeOvnClient.KubeovnV1().Subnets().Patch(context.Background(), subnet.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status"); err != nil {
+				klog.Error("patch subnet %s dhcp options failed: %v", subnet.Name, err)
 				return err
 			}
 		}

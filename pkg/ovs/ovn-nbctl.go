@@ -230,7 +230,7 @@ func (c Client) ListVirtualPort(ls string) ([]string, error) {
 }
 
 // CreatePort create logical switch port in ovn
-func (c Client) CreatePort(ls, port, ip, mac, pod, namespace string, portSecurity bool, securityGroups string, vips string, liveMigration bool) error {
+func (c Client) CreatePort(ls, port, ip, mac, pod, namespace string, portSecurity bool, securityGroups string, vips string, liveMigration, enableDHCP bool, dhcpOptions *DHCPOptions) error {
 	var ovnCommand []string
 	var addresses []string
 	addresses = append(addresses, mac)
@@ -291,6 +291,17 @@ func (c Client) CreatePort(ls, port, ip, mac, pod, namespace string, portSecurit
 			"--", "set", "logical_switch_port", port, fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
 	}
 
+	if enableDHCP {
+		if len(dhcpOptions.DHCPv4OptionsUUID) != 0 {
+			ovnCommand = append(ovnCommand,
+				"--", "lsp-set-dhcpv4-options", port, dhcpOptions.DHCPv4OptionsUUID)
+		}
+		if len(dhcpOptions.DHCPv6OptionsUUID) != 0 {
+			ovnCommand = append(ovnCommand,
+				"--", "lsp-set-dhcpv6-options", port, dhcpOptions.DHCPv6OptionsUUID)
+		}
+	}
+
 	if _, err := c.ovnNbCommand(ovnCommand...); err != nil {
 		klog.Errorf("create port %s failed: %v", port, err)
 		return err
@@ -347,28 +358,32 @@ func (c Client) ListPodLogicalSwitchPorts(pod, namespace string) ([]string, erro
 	return result, nil
 }
 
-func (c Client) SetLogicalSwitchConfig(ls, lr, protocol, subnet, gateway string, excludeIps []string, needRouter bool) error {
-	var err error
-	cidrBlocks := strings.Split(subnet, ",")
+type DHCPOptions struct {
+	DHCPv4OptionsUUID string
+	DHCPv6OptionsUUID string
+}
+
+func (c Client) SetLogicalSwitchConfig(ls, lr string, subnetSpec kubeovnv1.SubnetSpec, needRouter bool) (dhcpOptions *DHCPOptions, err error) {
+	cidrBlocks := strings.Split(subnetSpec.CIDRBlock, ",")
 	temp := strings.Split(cidrBlocks[0], "/")
 	if len(temp) != 2 {
 		klog.Errorf("cidrBlock %s is invalied", cidrBlocks[0])
-		return err
+		return nil, err
 	}
 	mask := temp[1]
 
 	var cmd []string
 	var networks string
-	switch protocol {
+	switch subnetSpec.Protocol {
 	case kubeovnv1.ProtocolIPv4:
-		networks = fmt.Sprintf("%s/%s", gateway, mask)
+		networks = fmt.Sprintf("%s/%s", subnetSpec.Gateway, mask)
 		cmd = []string{MayExist, "ls-add", ls}
 	case kubeovnv1.ProtocolIPv6:
-		gateway := strings.ReplaceAll(gateway, ":", "\\:")
+		gateway := strings.ReplaceAll(subnetSpec.Gateway, ":", "\\:")
 		networks = fmt.Sprintf("%s/%s", gateway, mask)
 		cmd = []string{MayExist, "ls-add", ls}
 	case kubeovnv1.ProtocolDual:
-		gws := strings.Split(gateway, ",")
+		gws := strings.Split(subnetSpec.Gateway, ",")
 		v6Mask := strings.Split(cidrBlocks[1], "/")[1]
 		gwStr := gws[0] + "/" + mask + "," + gws[1] + "/" + v6Mask
 		networks = strings.ReplaceAll(strings.Join(strings.Split(gwStr, ","), " "), ":", "\\:")
@@ -384,15 +399,29 @@ func (c Client) SetLogicalSwitchConfig(ls, lr, protocol, subnet, gateway string,
 	_, err = c.ovnNbCommand(cmd...)
 	if err != nil {
 		klog.Errorf("set switch config for %s failed: %v", ls, err)
-		return err
+		return nil, err
 	}
-	return nil
+
+	dhcpOptions = &DHCPOptions{}
+	if subnetSpec.EnableDHCP {
+		dhcpOptions.DHCPv4OptionsUUID, dhcpOptions.DHCPv6OptionsUUID, err = c.updateDHCPOptions(ls, subnetSpec.CIDRBlock, subnetSpec.Gateway, subnetSpec.DHCPv4Options)
+		if err != nil {
+			klog.Errorf("update dhcp options for switch %s failed: %v", ls, err)
+			return nil, err
+		}
+	} else {
+		err = c.deleteDhcpOptions(ls, kubeovnv1.ProtocolDual)
+		if err != nil {
+			klog.Errorf("delete dhcp options for switch %s failed: %v", ls, err)
+			return nil, err
+		}
+	}
+	return dhcpOptions, nil
 }
 
 // CreateLogicalSwitch create logical switch in ovn, connect it to router and apply tcp/udp lb rules
-func (c Client) CreateLogicalSwitch(ls, lr, protocol, subnet, gateway string, excludeIps []string, needRouter bool) error {
-	var err error
-	switch protocol {
+func (c Client) CreateLogicalSwitch(ls, lr string, subnetSpec kubeovnv1.SubnetSpec, needRouter bool) (dhcpOptions *DHCPOptions, err error) {
+	switch subnetSpec.Protocol {
 	case kubeovnv1.ProtocolIPv4:
 		_, err = c.ovnNbCommand(MayExist, "ls-add", ls, "--",
 			"set", "logical_switch", ls, fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
@@ -407,18 +436,27 @@ func (c Client) CreateLogicalSwitch(ls, lr, protocol, subnet, gateway string, ex
 
 	if err != nil {
 		klog.Errorf("create switch %s failed: %v", ls, err)
-		return err
+		return nil, err
 	}
 
-	ip := util.GetIpAddrWithMask(gateway, subnet)
+	ip := util.GetIpAddrWithMask(subnetSpec.Gateway, subnetSpec.CIDRBlock)
 	mac := util.GenerateMac()
 	if needRouter {
-		if err := c.createRouterPort(ls, lr, ip, mac); err != nil {
+		if err := c.createRouterPort(ls, lr, ip, mac, subnetSpec.EnableIPv6RA, subnetSpec.IPv6RAConfigs); err != nil {
 			klog.Errorf("failed to connect switch %s to router, %v", ls, err)
-			return err
+			return nil, err
 		}
 	}
-	return nil
+
+	dhcpOptions = &DHCPOptions{}
+	if subnetSpec.EnableDHCP {
+		dhcpOptions.DHCPv4OptionsUUID, dhcpOptions.DHCPv6OptionsUUID, err = c.createDHCPOptions(ls, subnetSpec.CIDRBlock, subnetSpec.Gateway, subnetSpec.DHCPv4Options)
+		if err != nil {
+			klog.Errorf("create dhcp options for switch %s failed: %v", ls, err)
+			return nil, err
+		}
+	}
+	return dhcpOptions, nil
 }
 
 func (c Client) AddLbToLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls string) error {
@@ -746,7 +784,7 @@ func (c Client) RemoveRouterPort(ls, lr string) error {
 	return nil
 }
 
-func (c Client) createRouterPort(ls, lr, ip, mac string) error {
+func (c Client) createRouterPort(ls, lr, ip, mac string, enableIPv6RA bool, ipv6RAConfigsStr string) error {
 	klog.Infof("add %s to %s with ip=%s, mac=%s", ls, lr, ip, mac)
 	lsTolr := fmt.Sprintf("%s-%s", ls, lr)
 	lrTols := fmt.Sprintf("%s-%s", lr, ls)
@@ -772,6 +810,31 @@ func (c Client) createRouterPort(ls, lr, ip, mac string) error {
 	if err != nil {
 		klog.Errorf("failed to create router port %s: %v", lrTols, err)
 		return err
+	}
+
+	if enableIPv6RA {
+		var ipv6Prefix string
+		switch util.CheckProtocol(ip) {
+		case kubeovnv1.ProtocolIPv4:
+			klog.Warningf("enable ipv6 router advertisement is not effective to IPv4")
+			return nil
+		case kubeovnv1.ProtocolIPv6:
+			ipv6Prefix = strings.Split(ipStr[1], "/")[0]
+		case kubeovnv1.ProtocolDual:
+			ipv6Prefix = strings.Split(ipStr[1], "/")[1]
+		}
+
+		if len(ipv6RAConfigsStr) == 0 {
+			// default ipv6_ra_configs
+			ipv6RAConfigsStr = "address_mode=dhcpv6_stateful, max_interval=30, min_interval=5, send_periodic=true"
+		}
+		_, err = c.ovnNbCommand("--",
+			"set", "logical_router_port", lrTols, fmt.Sprintf("ipv6_prefix=%s", ipv6Prefix), "--",
+			"set", "logical_router_port", lrTols, fmt.Sprintf("ipv6_ra_configs='%s'", ipv6RAConfigsStr))
+		if err != nil {
+			klog.Errorf("failed to set ipv6_prefix: %s ans ipv6_ra_configs: %s for router port: %s, err: %s", ipv6Prefix, ipv6RAConfigsStr, lrTols, err)
+			return err
+		}
 	}
 	return nil
 }
@@ -2102,4 +2165,219 @@ func (c *Client) PolicyRouteExists(priority int32, match string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+func (c *Client) createDHCPOptions(ls, cidrBlock, gateway, dhcpV4OptionsStr string) (dhcpV4OptionsUuid string, dhcpV6OptionsUuid string, err error) {
+	var v4CIDR, v6CIDR string
+	var v4Gateway string
+
+	switch util.CheckProtocol(cidrBlock) {
+	case kubeovnv1.ProtocolIPv4:
+		v4CIDR = cidrBlock
+		v4Gateway = gateway
+	case kubeovnv1.ProtocolIPv6:
+		v6CIDR = cidrBlock
+	case kubeovnv1.ProtocolDual:
+		cidrBlocks := strings.Split(cidrBlock, ",")
+		gateways := strings.Split(gateway, ",")
+		v4CIDR, v6CIDR = cidrBlocks[0], cidrBlocks[1]
+		v4Gateway = gateways[0]
+	}
+
+	if len(v4CIDR) > 0 {
+		mac := util.GenerateMac()
+		if len(dhcpV4OptionsStr) == 0 {
+			// default v4 dhcp_options
+			dhcpV4OptionsStr = fmt.Sprintf("lease_time=%d, router=%s, server_id=%s, server_mac=%s", 3600, v4Gateway, "169.254.0.254", mac)
+		}
+		output, err := c.ovnNbCommand("create", "dhcp_options",
+			fmt.Sprintf("cidr=%s", v4CIDR),
+			fmt.Sprintf("options='%s'", dhcpV4OptionsStr),
+			fmt.Sprintf("external_ids='logical_switch=%s protocol=%s'", ls, kubeovnv1.ProtocolIPv4))
+		if err != nil {
+			klog.Errorf("create dhcp options %s for switch %s failed: %v", v4CIDR, ls, err)
+			return "", "", err
+		}
+		dhcpV4OptionsUuid = strings.Split(output, "\n")[0]
+	}
+	if len(v6CIDR) > 0 {
+		mac := util.GenerateMac()
+		output, err := c.ovnNbCommand("create", "dhcp_options",
+			fmt.Sprintf("cidr=%s", v6CIDR),
+			fmt.Sprintf("options='server_id=%s'", mac),
+			fmt.Sprintf("external_ids='logical_switch=%s protocol=%s'", ls, kubeovnv1.ProtocolIPv6))
+		if err != nil {
+			klog.Errorf("create dhcp options %s for switch %s failed: %v", v6CIDR, ls, err)
+			return "", "", err
+		}
+		dhcpV6OptionsUuid = strings.Split(output, "\n")[0]
+	}
+
+	return dhcpV4OptionsUuid, dhcpV6OptionsUuid, nil
+}
+
+func (c *Client) updateDHCPOptions(ls, cidrBlock, gateway, dhcpV4OptionsStr string) (dhcpV4OptionsUuid string, dhcpV6OptionsUuid string, err error) {
+	dhcpV4Options, err := c.listDHCPOptions(ls, kubeovnv1.ProtocolIPv4)
+	if err != nil {
+		klog.Errorf("list dhcp options for switch %s protocol %s failed: %v", ls, kubeovnv1.ProtocolIPv4, err)
+		return "", "", err
+	}
+	dhcpV6Options, err := c.listDHCPOptions(ls, kubeovnv1.ProtocolIPv6)
+	if err != nil {
+		klog.Errorf("list dhcp options for switch %s protocol %s failed: %v", ls, kubeovnv1.ProtocolIPv6, err)
+		return "", "", err
+	}
+
+	var v4CIDR, v6CIDR string
+	var v4Gateway string
+	switch util.CheckProtocol(cidrBlock) {
+	case kubeovnv1.ProtocolIPv4:
+		v4CIDR = cidrBlock
+		v4Gateway = gateway
+	case kubeovnv1.ProtocolIPv6:
+		v6CIDR = cidrBlock
+	case kubeovnv1.ProtocolDual:
+		cidrBlocks := strings.Split(cidrBlock, ",")
+		gateways := strings.Split(gateway, ",")
+		v4CIDR, v6CIDR = cidrBlocks[0], cidrBlocks[1]
+		v4Gateway = gateways[0]
+	}
+
+	if len(v4CIDR) > 0 {
+		if len(dhcpV4Options) == 0 {
+			dhcpV4OptionsUuid, _, err = c.createDHCPOptions(ls, v4CIDR, v4Gateway, dhcpV4OptionsStr)
+			if err != nil {
+				klog.Errorf("create dhcp options for switch %s failed: %v", ls, err)
+				return "", "", err
+			}
+		} else {
+			dhcpOptions := dhcpV4Options[0]
+			if len(dhcpV4OptionsStr) == 0 {
+				// default dhcp v4 options
+				dhcpV4OptionsStr = fmt.Sprintf("lease_time=%d, router=%s, server_id=%s, server_mac=%s", 3600, v4Gateway, "169.254.0.254", dhcpOptions.Options.ServerMac)
+			}
+			_, err = c.ovnNbCommand("set", "dhcp_options", dhcpOptions.UUID, fmt.Sprintf("cidr=%s", v4CIDR), fmt.Sprintf("options='%s'", dhcpV4OptionsStr))
+			if err != nil {
+				klog.Errorf("set cidr and options for dhcp v4 options %s failed: %v", dhcpOptions.UUID, err)
+				return "", "", err
+			}
+			dhcpV4OptionsUuid = dhcpOptions.UUID
+		}
+	} else if len(dhcpV4Options) > 0 {
+		// delete dhcp v4 options
+		err = c.deleteDhcpOptions(ls, kubeovnv1.ProtocolIPv4)
+		if err != nil {
+			klog.Errorf("delete dhcp options for switch %s protocol %s failed: %v", ls, kubeovnv1.ProtocolIPv4, err)
+			return "", "", err
+		}
+	}
+
+	if len(v6CIDR) > 0 {
+		if len(dhcpV6Options) == 0 {
+			_, dhcpV6OptionsUuid, err = c.createDHCPOptions(ls, v4CIDR, v4Gateway, "")
+			if err != nil {
+				klog.Errorf("create dhcp options for switch %s failed: %v", ls, err)
+				return "", "", err
+			}
+		} else {
+			dhcpOptions := dhcpV6Options[0]
+			if v6CIDR != dhcpOptions.CIDR {
+				_, err = c.ovnNbCommand("set", "dhcp_options", dhcpOptions.UUID, fmt.Sprintf("cidr=%s", v6CIDR))
+				if err != nil {
+					klog.Errorf("set cidr for dhcp v6 options %s failed: %v", dhcpOptions.UUID, err)
+					return "", "", err
+				}
+			}
+			dhcpV6OptionsUuid = dhcpOptions.UUID
+		}
+	} else if len(dhcpV6Options) > 0 {
+		// delete dhcp v6 options
+		err = c.deleteDhcpOptions(ls, kubeovnv1.ProtocolIPv6)
+		if err != nil {
+			klog.Errorf("delete dhcp options for switch %s protocol %s failed: %v", ls, kubeovnv1.ProtocolIPv6, err)
+			return "", "", err
+		}
+	}
+
+	return dhcpV4OptionsUuid, dhcpV6OptionsUuid, nil
+}
+
+type DhcpOption struct {
+	UUID        string
+	CIDR        string
+	ExternalIds string
+	Options     Options
+}
+
+type Options struct {
+	LeaseTime string
+	Router    string
+	ServerId  string
+	ServerMac string
+}
+
+func (c Client) listDHCPOptions(ls string, protocol string) ([]DhcpOption, error) {
+	output, err := c.ovnNbCommand("--format=csv", "--no-heading", "--data=bare", "--columns=_uuid,cidr,external_ids,options", "find", "dhcp_options", fmt.Sprintf("external_ids='ls=%s protocol=%s'", ls, protocol))
+	if err != nil {
+		klog.Errorf("failed to find dhcp options, %v", err)
+		return nil, err
+	}
+	entries := strings.Split(output, "\n")
+	dhcpOptions := make([]DhcpOption, 0, len(entries))
+	for _, entry := range strings.Split(output, "\n") {
+		if len(strings.Split(entry, ",")) == 4 {
+			t := strings.Split(entry, ",")
+			option := Options{}
+			for _, op := range strings.Split(t[3], " ") {
+				op = strings.TrimSpace(op)
+				if strings.HasPrefix(op, "lease_time=") {
+					option.LeaseTime = strings.TrimPrefix(op, "lease_time=")
+				}
+				if strings.HasPrefix(op, "router=") {
+					option.Router = strings.TrimPrefix(op, "router=")
+				}
+				if strings.HasPrefix(op, "server_id=") {
+					option.ServerId = strings.TrimPrefix(op, "server_id=")
+				}
+				if strings.HasPrefix(op, "server_mac=") {
+					option.ServerMac = strings.TrimPrefix(op, "server_mac=")
+				}
+			}
+			dhcpOptions = append(dhcpOptions,
+				DhcpOption{UUID: strings.TrimSpace(t[0]), CIDR: strings.TrimSpace(t[1]), ExternalIds: strings.TrimSpace(t[2]), Options: option})
+		}
+	}
+	return dhcpOptions, nil
+}
+
+func (c *Client) deleteDhcpOptions(ls string, protocol string) error {
+	var filterTemplate string
+	if protocol == kubeovnv1.ProtocolDual {
+		filterTemplate = fmt.Sprintf("external_ids:ls=%s", ls)
+	} else {
+		filterTemplate = fmt.Sprintf("external_ids:ls=%s protocol=%s", ls, protocol)
+	}
+	cmd := []string{"--format=csv", "--data=bare", "--no-heading", "--columns=_uuid", "find", "dhcp_options", filterTemplate}
+	output, err := c.ovnNbCommand(cmd...)
+	if err != nil {
+		klog.Errorf("failed to find dhcp options for switch %s protocol %s, %v", ls, protocol, err)
+		return err
+	}
+
+	if output == "" {
+		return nil
+	}
+	lines := strings.Split(output, "\n")
+	for _, l := range lines {
+		if len(strings.TrimSpace(l)) == 0 {
+			continue
+		}
+		_, err = c.ovnNbCommand("dhcp-options-del", l)
+		if err != nil {
+			klog.Errorf("delete dhcp options %s failed: %v", l, err)
+			return err
+		}
+	}
+
+	return nil
 }
